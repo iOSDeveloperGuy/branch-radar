@@ -162,7 +162,7 @@ struct ProjectionAndRecommendationTests {
     }
 }
 
-private func pr(id: Int, source: String, sourceCommit: String, targetCommit: String) -> PullRequestSummary {
+func pr(id: Int, source: String, sourceCommit: String, targetCommit: String) -> PullRequestSummary {
     let repository = RepositoryIdentity(projectKey: "DEMO", slug: "sample-service")
     return PullRequestSummary(
         id: id,
@@ -175,7 +175,7 @@ private func pr(id: Int, source: String, sourceCommit: String, targetCommit: Str
 
 private func numberedLines(_ count: Int) -> String { (1...count).map { "line-\($0)" }.joined(separator: "\n") + "\n" }
 
-private final class TestRepo {
+final class TestRepo {
     let url: URL
     init() throws {
         url = FileManager.default.temporaryDirectory.appendingPathComponent("branch-radar-v04-tests").appendingPathComponent(UUID().uuidString)

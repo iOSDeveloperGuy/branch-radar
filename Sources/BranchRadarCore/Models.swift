@@ -90,6 +90,82 @@ public struct PullRequestReport: Codable, Equatable, Sendable {
     }
 }
 
+
+public enum MergeStrategyKind: String, Codable, Sendable {
+    case mergeCommit = "merge_commit"
+    case fastForward = "fast_forward"
+    case fastForwardOnly = "fast_forward_only"
+    case rebaseMerge = "rebase_merge"
+    case rebaseFastForward = "rebase_fast_forward"
+    case squash
+    case squashFastForwardOnly = "squash_fast_forward_only"
+    case unknown
+}
+
+public struct MergeStrategy: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let flag: String?
+    public let kind: MergeStrategyKind
+
+    public init(id: String, name: String? = nil, flag: String? = nil) {
+        self.id = id
+        self.name = name ?? id
+        self.flag = flag
+        self.kind = Self.classify(id: id, flag: flag)
+    }
+
+    private static func classify(id: String, flag: String?) -> MergeStrategyKind {
+        let value = id.lowercased()
+        if value.contains("rebase") && value.contains("ff-only") { return .rebaseFastForward }
+        if value.contains("rebase") { return .rebaseMerge }
+        if value.contains("squash") && value.contains("ff-only") { return .squashFastForwardOnly }
+        if value.contains("squash") { return .squash }
+        if value == "no-ff" { return .mergeCommit }
+        if value == "ff" { return .fastForward }
+        if value == "ff-only" { return .fastForwardOnly }
+        if flag == "--no-ff" { return .mergeCommit }
+        if flag == "--ff" { return .fastForward }
+        if flag == "--ff-only" { return .fastForwardOnly }
+        if flag == "--squash" { return .squash }
+        return .unknown
+    }
+}
+
+public struct MergeStrategyConfiguration: Codable, Equatable, Sendable {
+    public let defaultStrategy: MergeStrategy
+    public let strategies: [MergeStrategy]
+    public init(defaultStrategy: MergeStrategy, strategies: [MergeStrategy]) {
+        self.defaultStrategy = defaultStrategy
+        self.strategies = strategies
+    }
+}
+
+public enum MergeStrategySource: String, Codable, Sendable {
+    case commandLine = "command_line"
+    case autoMerge = "auto_merge"
+    case repositoryDefault = "repository_default"
+}
+
+public struct MergeStrategySelection: Codable, Equatable, Sendable {
+    public let strategy: MergeStrategy
+    public let source: MergeStrategySource
+    public let alternativeStrategyIDs: [String]
+
+    public init(strategy: MergeStrategy, source: MergeStrategySource, alternativeStrategyIDs: [String] = []) {
+        self.strategy = strategy
+        self.source = source
+        self.alternativeStrategyIDs = alternativeStrategyIDs
+    }
+
+    public var isAssumption: Bool { source == .repositoryDefault && !alternativeStrategyIDs.isEmpty }
+
+    public static let legacyMergeCommit = MergeStrategySelection(
+        strategy: MergeStrategy(id: "no-ff", name: "Merge commit", flag: "--no-ff"),
+        source: .repositoryDefault
+    )
+}
+
 public enum RiskLevel: String, Codable, Sendable, Comparable {
     case medium
     case high
@@ -119,17 +195,31 @@ public enum ProjectionOutcome: String, Codable, Sendable {
     case risk
     case conflict
     case incomingConflict = "incoming_conflict"
+    case strategyRejected = "strategy_rejected"
     case unavailable
 }
 
 public struct PullRequestProjection: Codable, Equatable, Sendable {
     public let pullRequest: PullRequestSummary
     public let outcome: ProjectionOutcome
+    public let mergeStrategy: MergeStrategySelection
     public let conflicts: [Conflict]
     public let risks: [CollisionRisk]
     public let message: String?
-    public init(pullRequest: PullRequestSummary, outcome: ProjectionOutcome, conflicts: [Conflict] = [], risks: [CollisionRisk] = [], message: String? = nil) {
-        self.pullRequest = pullRequest; self.outcome = outcome; self.conflicts = conflicts; self.risks = risks; self.message = message
+    public init(
+        pullRequest: PullRequestSummary,
+        outcome: ProjectionOutcome,
+        mergeStrategy: MergeStrategySelection = .legacyMergeCommit,
+        conflicts: [Conflict] = [],
+        risks: [CollisionRisk] = [],
+        message: String? = nil
+    ) {
+        self.pullRequest = pullRequest
+        self.outcome = outcome
+        self.mergeStrategy = mergeStrategy
+        self.conflicts = conflicts
+        self.risks = risks
+        self.message = message
     }
 }
 
@@ -169,7 +259,7 @@ public struct ProjectionReport: Codable, Equatable, Sendable {
     public let targetFreshness: TargetFreshness?
     public let projections: [PullRequestProjection]
     public let recommendations: [Recommendation]
-    public init(schemaVersion: Int = 2, branch: String, target: String, current: BranchAnalysis, targetFreshness: TargetFreshness? = nil, projections: [PullRequestProjection], recommendations: [Recommendation] = []) {
+    public init(schemaVersion: Int = 3, branch: String, target: String, current: BranchAnalysis, targetFreshness: TargetFreshness? = nil, projections: [PullRequestProjection], recommendations: [Recommendation] = []) {
         self.schemaVersion = schemaVersion; self.branch = branch; self.target = target; self.current = current
         self.targetFreshness = targetFreshness; self.projections = projections; self.recommendations = recommendations
     }
@@ -181,7 +271,7 @@ public struct ProjectedScanReport: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let target: String
     public let branches: [ProjectionReport]
-    public init(schemaVersion: Int = 2, target: String, branches: [ProjectionReport]) {
+    public init(schemaVersion: Int = 3, target: String, branches: [ProjectionReport]) {
         self.schemaVersion = schemaVersion; self.target = target; self.branches = branches
     }
     public var hasConflicts: Bool { branches.contains { $0.hasConflicts } }

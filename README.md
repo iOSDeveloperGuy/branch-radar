@@ -4,17 +4,17 @@ Find merge conflicts and collision risk before they surprise you.
 
 `branch-radar` is a Swift CLI that asks Git whether your branches merge cleanly now and, with Bitbucket Data Center, whether they would still merge after another open pull request lands first.
 
-The core rule is simple: **Bitbucket tells branch-radar what may land; Git decides whether it conflicts.** Real conflicts come from Git's own merge machinery. Heuristic overlap is reported separately as **risk**.
+The core rule is simple: **Bitbucket tells branch-radar what may land; Git decides what that history would do.** Proven conflicts come from Git's merge machinery. Heuristic overlap is reported separately as **risk**.
 
 ## Status
 
-**v0.4** includes:
+**v0.5** includes:
 
 - local branch conflict checks
 - Bitbucket Data Center open-PR discovery
 - projected conflicts after another PR lands
+- merge-strategy-aware projection for merge, fast-forward, squash, and rebase workflows
 - collision-risk detection for changes that still merge cleanly
-- shared-file and rename/delete interaction evidence
 - target freshness checks against Bitbucket's target SHA
 - deterministic recommendations
 - stable JSON for agents and scripts
@@ -23,7 +23,7 @@ The core rule is simple: **Bitbucket tells branch-radar what may land; Git decid
 ## Requirements
 
 - Swift 6+
-- Git with `git merge-tree --write-tree` support
+- Git with `git merge-tree --write-tree` and `--merge-base` support
 - macOS or Linux
 - Bitbucket Data Center access token for PR discovery/projection commands
 
@@ -89,16 +89,19 @@ Current: ✓ clean
 
 ✗ after PR #42: Validation changes
   feature/validation → develop
+  strategy: Rebase and fast-forward [rebase-ff-only, auto_merge]
   ! Sources/App/Service.swift [content]
+
 ◐ after PR #43: Logging cleanup
   feature/logging → develop
+  strategy: Squash [squash, repository_default; manual merge may choose: no-ff]
   ◐ Sources/App/Logger.swift [medium, shared_file]
 
 Recommended:
   • PR #42 is projected to conflict if it lands first. Finish this branch before that PR, or plan to rebase afterward.
   • PR #43 overlaps this branch but Git still merges it cleanly. Review the shared code before both changes land.
 
-Summary: 2 scenarios, 1 projected conflicts, 1 collision risks
+Summary: 2 scenarios, 1 projected conflicts, 1 collision risks, 0 strategy rejections
 ```
 
 For all local branches:
@@ -109,19 +112,70 @@ branch-radar scan --projected --target origin/develop
 
 ### What the states mean
 
-- `✗ conflict`: Git itself cannot produce a clean merge.
-- `◐ risk`: Git produces a clean merge, but both changes touch related code.
+- `✗ conflict`: Git itself cannot produce the projected merge.
+- `◐ risk`: the projected merge is clean, but both changes touch related code.
 - `✓ clean`: no conflict or collision evidence was found.
-- `? unavailable`: the scenario could not be proven with the available refs/objects.
-- `! incoming_conflict`: the incoming PR itself does not currently merge cleanly into its target.
+- `⊘ strategy_rejected`: the selected merge strategy cannot land that PR in its current history, such as an out-of-date branch under fast-forward-only.
+- `? unavailable`: the scenario could not be proven with the available refs/objects or uses an unsupported strategy.
+- `! incoming_conflict`: applying the incoming PR with the selected strategy conflicts before branch-radar can project your branch afterward.
 
 **Risk does not cause exit code `1`.** That exit code remains reserved for proven conflicts.
 
-### Collision-risk evidence
+## Merge-strategy-aware projection
 
-v0.4 intentionally avoids a made-up numeric score. It reports concrete evidence:
+v0.5 models the history shape produced by the selected Bitbucket merge strategy instead of treating every PR as a merge commit.
 
-- `shared_file` (`medium`): both changes modify the same file, but different hunks merge cleanly.
+Supported strategy families:
+
+| Strategy family | Common Bitbucket ID | Projection behavior |
+| --- | --- | --- |
+| Merge commit | `no-ff` | Three-way merge, then synthetic two-parent merge commit |
+| Fast-forward | `ff` | Fast-forward when possible; otherwise merge-commit semantics |
+| Fast-forward only | `ff-only` | Rejects the scenario unless target is an ancestor of source |
+| Rebase, merge | `rebase-no-ff` | Replays source commits onto target, then creates a synthetic merge commit |
+| Rebase, fast-forward | `rebase-ff-only` | Replays source commits onto target and uses the rebased tip |
+| Squash | `squash` | Three-way merge result represented as one synthetic commit on target |
+| Squash, fast-forward only | `squash-ff-only` | Requires an up-to-date source, then uses squash semantics |
+
+### How branch-radar chooses a strategy
+
+For each projected PR, strategy selection uses this precedence:
+
+1. `--merge-strategy <id>` when you explicitly provide an enabled repository strategy.
+2. The strategy already selected for that PR's Bitbucket auto-merge request, when present.
+3. The repository's effective default merge strategy.
+
+The output and JSON report the strategy **and its source**.
+
+A repository default is not always a prediction of what a human will choose. If multiple strategies are enabled, a manual merge can select another one. In that case branch-radar marks the repository-default selection as an assumption and includes the alternative enabled strategy IDs.
+
+To force a scenario using one enabled strategy:
+
+```bash
+branch-radar project feature/my-change \
+  --target origin/develop \
+  --merge-strategy rebase-ff-only
+```
+
+This is useful when you know how a particular PR will be merged or when comparing strategy-dependent outcomes.
+
+### Rebase simulation
+
+Rebase projection is intentionally commit-aware. branch-radar:
+
+1. finds the merge base between the PR source and target;
+2. enumerates the source branch's non-merge commits in replay order;
+3. replays each commit onto a synthetic target using Git's three-way merge machinery and the original commit parent as the explicit merge base;
+4. creates only unreferenced synthetic commits with `git commit-tree`;
+5. stops and reports `incoming_conflict` if an intermediate replay conflicts.
+
+That distinction matters because a branch's final tree can sometimes merge cleanly even though replaying one of its intermediate commits would fail under a rebase strategy.
+
+## Collision-risk evidence
+
+v0.5 intentionally avoids a made-up numeric score. It reports concrete evidence:
+
+- `shared_file` (`medium`): both changes modify the same file, but Git still merges them cleanly.
 - `overlapping_lines` (`high`): both changes touch overlapping base-line ranges and Git still merges them cleanly.
 - `structural_change` (`high`): a rename/delete/copy interaction overlaps another change to the same path.
 
@@ -129,7 +183,7 @@ These signals are advisory. They are not called conflicts unless Git reports a c
 
 ## Target freshness
 
-Projected analysis uses Bitbucket's target commit SHA. If your local target ref is behind or diverged, branch-radar reports that separately and recommends refreshing it. This avoids presenting a stale local `origin/develop` check as if it were current server state.
+Projected analysis uses Bitbucket's target commit SHA. If your local target ref is behind or diverged, branch-radar reports that separately and recommends refreshing it. This avoids presenting a stale local target check as if it were current server state.
 
 ## Agent / JSON interface
 
@@ -137,12 +191,15 @@ Projected analysis uses Bitbucket's target commit SHA. If your local target ref 
 branch-radar scan --projected --target origin/develop --json
 ```
 
-Projected reports use schema version `2` in v0.4. New fields include:
+Projected reports use schema version `3` in v0.5. Strategy-aware fields include:
 
-- `targetFreshness`
-- `risks` on each projected scenario
-- `recommendations`
-- projection outcome `risk`
+- `mergeStrategy.strategy.id`
+- `mergeStrategy.strategy.kind`
+- `mergeStrategy.source`
+- `mergeStrategy.alternativeStrategyIDs`
+- projection outcome `strategy_rejected`
+
+Existing v0.4 fields remain available, including `targetFreshness`, `risks`, and `recommendations`.
 
 Recommendation codes are stable machine values:
 
@@ -155,26 +212,11 @@ Recommendation codes are stable machine values:
 
 | Code | Meaning |
 | ---: | --- |
-| `0` | Analysis completed with no proven current/projected conflicts; advisory risk may still exist |
+| `0` | Analysis completed with no proven current/projected conflicts; advisory risk or strategy rejection may still exist |
 | `1` | A current or projected Git conflict was found |
 | `2` | Git/repository error |
 | `3` | Bitbucket/provider error |
-| `4` | Invalid arguments/configuration |
-
-## Projection algorithm
-
-For each relevant open PR, branch-radar:
-
-1. reads the PR source and target commit SHAs from Bitbucket;
-2. ensures those Git objects are available locally;
-3. uses `git merge-tree` to test the incoming PR against its current target;
-4. creates an unreferenced synthetic merge commit with `git commit-tree` when that merge is clean;
-5. uses `git merge-tree` again to test your branch against that synthetic future target;
-6. if the future merge is clean, compares each side's changes from its merge base to identify collision-risk evidence.
-
-v0.4 models the incoming PR as a normal merge commit. Squash-only or rebase-only repositories can produce a different future history.
-
-Cross-repository/fork PR projection remains `unavailable` in v0.4.
+| `4` | Invalid arguments or configuration |
 
 ## Fetch safety
 
@@ -193,8 +235,8 @@ Disable object fetching with `--no-fetch`.
 Analysis commands do not:
 
 - checkout or switch branches
-- rebase
-- merge into your branch
+- rebase your branches
+- merge into your branches
 - modify the index
 - modify tracked files
 - update local or remote-tracking branch refs
@@ -202,11 +244,17 @@ Analysis commands do not:
 
 `git merge-tree`, `git commit-tree`, and projection fetches can create unreachable objects in the repository object database. They do not move refs or modify the worktree.
 
+## Current limitations
+
+- Cross-repository/fork PR projection is reported as `unavailable`.
+- Unknown/custom merge-strategy IDs are reported as `unavailable` rather than guessed.
+- For manual merges, the effective repository default is an assumption when other strategies are enabled.
+- Rebase projection currently replays non-merge commits; source histories containing merge commits are not reconstructed as merge-preserving rebases.
+
 ## Roadmap
 
-### v0.5
+### v0.6
 
-- merge-strategy-aware projection for merge/squash/rebase workflows
 - GitHub and GitLab providers
 - cross-repository PR projections
 - optional MCP wrapper
@@ -219,4 +267,4 @@ swift test
 swift build -c release
 ```
 
-The current regression suite covers clean/conflicting merges, add/add classification, projected conflicts, shared-file collision risk, rename/edit structural risk, stale target detection, Bitbucket filtering, and ref-safe object fetching.
+The regression suite covers clean/conflicting merges, collision risk, target freshness, Bitbucket strategy discovery, auto-merge strategy selection, strategy classification, fast-forward-only rejection, squash projection, rebase projection, strategy-dependent conflict behavior, and ref-safe object fetching.

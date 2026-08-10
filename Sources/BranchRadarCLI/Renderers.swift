@@ -50,6 +50,7 @@ struct HumanRenderer {
                 let pr = projection.pullRequest
                 lines.append("\(projectionSymbol(projection.outcome)) after PR #\(pr.id): \(pr.title)")
                 lines.append("  \(pr.source.branchName) → \(pr.target.branchName)")
+                lines.append("  strategy: \(strategyDescription(projection.mergeStrategy))")
                 appendConflicts(projection.conflicts, to: &lines, indent: "  ")
                 appendRisks(projection.risks, to: &lines, indent: "  ")
                 if let message = projection.message { lines.append("  \(message)") }
@@ -61,7 +62,9 @@ struct HumanRenderer {
         }
         let conflicts = report.projections.filter { $0.outcome == .conflict }.count
         let risks = report.projections.filter { $0.outcome == .risk }.count
-        lines.append(""); lines.append("Summary: \(report.projections.count) scenarios, \(conflicts) projected conflicts, \(risks) collision risks")
+        let rejected = report.projections.filter { $0.outcome == .strategyRejected }.count
+        lines.append("")
+        lines.append("Summary: \(report.projections.count) scenarios, \(conflicts) projected conflicts, \(risks) collision risks, \(rejected) strategy rejections")
         return lines.joined(separator: "\n")
     }
 
@@ -73,9 +76,13 @@ struct HumanRenderer {
             let conflicts = branch.projections.filter { $0.outcome == .conflict }
             let risks = branch.projections.filter { $0.outcome == .risk }
             let unavailable = branch.projections.filter { $0.outcome == .unavailable || $0.outcome == .incomingConflict }
-            if conflicts.isEmpty && risks.isEmpty { lines.append("  projected: clean across \(branch.projections.count) scenarios") }
-            for projection in conflicts { lines.append("  ✗ conflicts after PR #\(projection.pullRequest.id): \(projection.pullRequest.title)"); appendConflicts(projection.conflicts, to: &lines, indent: "    ") }
-            for projection in risks { lines.append("  ◐ risk after PR #\(projection.pullRequest.id): \(projection.pullRequest.title)"); appendRisks(projection.risks, to: &lines, indent: "    ") }
+            let rejected = branch.projections.filter { $0.outcome == .strategyRejected }
+            if conflicts.isEmpty && risks.isEmpty && rejected.isEmpty && unavailable.isEmpty {
+                lines.append("  projected: clean across \(branch.projections.count) scenarios")
+            }
+            for projection in conflicts { lines.append("  ✗ conflicts after PR #\(projection.pullRequest.id) [\(projection.mergeStrategy.strategy.id)]: \(projection.pullRequest.title)"); appendConflicts(projection.conflicts, to: &lines, indent: "    ") }
+            for projection in risks { lines.append("  ◐ risk after PR #\(projection.pullRequest.id) [\(projection.mergeStrategy.strategy.id)]: \(projection.pullRequest.title)"); appendRisks(projection.risks, to: &lines, indent: "    ") }
+            for projection in rejected { lines.append("  ⊘ rejected by \(projection.mergeStrategy.strategy.id) for PR #\(projection.pullRequest.id): \(projection.pullRequest.title)") }
             if !unavailable.isEmpty { lines.append("  ? \(unavailable.count) scenario(s) unavailable") }
             if let first = branch.recommendations.first { lines.append("  → \(first.message)") }
             if index != report.branches.count - 1 { lines.append("") }
@@ -94,8 +101,28 @@ struct HumanRenderer {
     }
     private func symbol(for status: AnalysisStatus) -> String { status == .clean ? "✓" : "✗" }
     private func projectionSymbol(_ outcome: ProjectionOutcome) -> String {
-        switch outcome { case .clean: return "✓"; case .risk: return "◐"; case .conflict: return "✗"; case .incomingConflict: return "!"; case .unavailable: return "?" }
+        switch outcome {
+        case .clean: return "✓"
+        case .risk: return "◐"
+        case .conflict: return "✗"
+        case .incomingConflict: return "!"
+        case .strategyRejected: return "⊘"
+        case .unavailable: return "?"
+        }
     }
+    private func strategyDescription(_ selection: MergeStrategySelection) -> String {
+        let source: String
+        switch selection.source {
+        case .commandLine: source = "command-line override"
+        case .autoMerge: source = "auto-merge selection"
+        case .repositoryDefault: source = "repository default"
+        }
+        if selection.isAssumption {
+            return "\(selection.strategy.name) [\(selection.strategy.id)] (\(source); manual merge may choose: \(selection.alternativeStrategyIDs.joined(separator: ", ")))"
+        }
+        return "\(selection.strategy.name) [\(selection.strategy.id)] (\(source))"
+    }
+
     private func freshnessSymbol(_ status: TargetFreshnessStatus) -> String { status == .current ? "✓" : status == .unavailable ? "?" : "!" }
     private func shortOID(_ oid: String) -> String { String(oid.prefix(10)) }
 }
