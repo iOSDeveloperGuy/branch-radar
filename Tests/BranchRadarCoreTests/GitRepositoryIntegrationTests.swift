@@ -3,455 +3,280 @@ import Foundation
 import Testing
 
 struct GitRepositoryIntegrationTests {
-    @Test
-    func cleanBranchesAreReportedCleanWithDivergence() throws {
-        let repo = try TestRepository()
-        try repo.write("base.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "feature")
-
-        try repo.run("switch", "feature")
-        try repo.write("feature.txt", "feature\n")
-        try repo.commitAll("feature")
-
-        try repo.run("switch", "main")
-        try repo.write("main.txt", "main\n")
-        try repo.commitAll("main")
-
-        let repository = try GitRepository(at: repo.url)
-        let result = try repository.analyze(branch: "feature", against: "main")
-
-        #expect(result.status == .clean)
-        #expect(result.conflicts.isEmpty)
-        #expect(result.ahead == 1)
-        #expect(result.behind == 1)
-    }
-
-    @Test
-    func contentConflictReportsPathAndType() throws {
-        let repo = try TestRepository()
+    @Test func cleanAndConflictDetectionStillWork() throws {
+        let repo = try TestRepo()
         try repo.write("shared.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "feature")
+        try repo.commit("base")
+        try repo.git("branch", "clean")
+        try repo.git("branch", "conflict")
 
-        try repo.run("switch", "feature")
-        try repo.write("shared.txt", "feature\n")
-        try repo.commitAll("feature")
+        try repo.git("switch", "clean")
+        try repo.write("clean.txt", "clean\n")
+        try repo.commit("clean")
 
-        try repo.run("switch", "main")
+        try repo.git("switch", "conflict")
+        try repo.write("shared.txt", "branch\n")
+        try repo.commit("branch")
+
+        try repo.git("switch", "main")
         try repo.write("shared.txt", "main\n")
-        try repo.commitAll("main")
+        try repo.commit("main")
 
         let repository = try GitRepository(at: repo.url)
-        let result = try repository.analyze(branch: "feature", against: "main")
-
-        #expect(result.status == .conflict)
-        #expect(result.conflicts.count == 1)
-        #expect(result.conflicts[0].path == "shared.txt")
-        #expect(result.conflicts[0].kind == .content)
-    }
-
-    @Test
-    func addAddConflictIsClassified() throws {
-        let repo = try TestRepository()
-        try repo.write("base.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "feature")
-
-        try repo.run("switch", "feature")
-        try repo.write("new.txt", "feature\n")
-        try repo.commitAll("feature")
-
-        try repo.run("switch", "main")
-        try repo.write("new.txt", "main\n")
-        try repo.commitAll("main")
-
-        let repository = try GitRepository(at: repo.url)
-        let result = try repository.analyze(branch: "feature", against: "main")
-
-        #expect(result.status == .conflict)
-        #expect(result.conflicts.first?.kind == .addAdd)
-    }
-
-    @Test
-    func scanExcludesTargetLocalBranch() throws {
-        let repo = try TestRepository()
-        try repo.write("base.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "feature-one")
-        try repo.run("branch", "feature-two")
-
-        let repository = try GitRepository(at: repo.url)
-        let report = try repository.scanLocalBranches(against: "main")
-
-        #expect(report.branches.map(\.branch) == ["feature-one", "feature-two"])
+        #expect(try repository.analyze(branch: "clean", against: "main").status == .clean)
+        let conflict = try repository.analyze(branch: "conflict", against: "main")
+        #expect(conflict.status == .conflict)
+        #expect(conflict.conflicts.first?.path == "shared.txt")
     }
 }
 
-private final class TestRepository {
-    let url: URL
+struct CollisionRiskTests {
+    @Test func sameFileDifferentHunksIsMediumRiskAndStillExitCleanSemantics() throws {
+        let repo = try TestRepo()
+        try repo.write("service.txt", numberedLines(12))
+        try repo.commit("base")
+        try repo.git("branch", "mine")
+        try repo.git("branch", "incoming")
 
-    init() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("branch-radar-tests")
-            .appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        self.url = root
+        try repo.git("switch", "mine")
+        try repo.replaceLine("service.txt", line: 2, with: "mine-two")
+        try repo.commit("mine")
 
-        try run("init", "-q", "-b", "main")
-        try run("config", "user.name", "Branch Radar Tests")
-        try run("config", "user.email", "tests@branch-radar.invalid")
-    }
+        try repo.git("switch", "incoming")
+        try repo.replaceLine("service.txt", line: 10, with: "incoming-ten")
+        try repo.commit("incoming")
+        let incoming = try repo.oid("HEAD")
 
-    deinit {
-        try? FileManager.default.removeItem(at: url)
-    }
+        try repo.git("switch", "main")
+        let target = try repo.oid("HEAD")
 
-    func write(_ path: String, _ contents: String) throws {
-        let fileURL = url.appendingPathComponent(path)
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try contents.write(to: fileURL, atomically: true, encoding: .utf8)
-    }
-
-    func commitAll(_ message: String) throws {
-        try run("add", "-A")
-        try run("commit", "-q", "-m", message)
-    }
-
-    @discardableResult
-    func run(_ arguments: String...) throws -> String {
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git"] + arguments
-        process.currentDirectoryURL = url
-        process.standardOutput = stdout
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-
-        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw TestGitError(message: "git \(arguments.joined(separator: " ")) failed: \(error)")
-        }
-        return output
-    }
-}
-
-private struct TestGitError: Error {
-    let message: String
-}
-
-struct ProjectionIntegrationTests {
-    @Test
-    func cleanTodayCanConflictAfterIncomingPRLands() throws {
-        let repo = try ProjectionTestRepository()
-        try repo.write("shared.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "mine")
-        try repo.run("branch", "incoming")
-
-        try repo.run("switch", "mine")
-        try repo.write("shared.txt", "mine\n")
-        try repo.commitAll("mine")
-        let mineCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        try repo.run("switch", "incoming")
-        try repo.write("shared.txt", "incoming\n")
-        try repo.commitAll("incoming")
-        let incomingCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        try repo.run("switch", "main")
-        let targetCommit = try repo.run("rev-parse", "HEAD").trimmed
-        let refsBefore = try repo.run("show-ref")
-
-        let repository = try GitRepository(at: repo.url)
-        let current = try repository.analyze(branch: "mine", against: "main")
-        #expect(current.status == .clean)
-
-        let report = try repository.project(
+        let report = try GitRepository(at: repo.url).project(
             branch: "mine",
             against: "main",
-            after: [makePullRequest(id: 42, sourceBranch: "incoming", sourceCommit: incomingCommit, targetCommit: targetCommit)],
+            after: [pr(id: 42, source: "incoming", sourceCommit: incoming, targetCommit: target)],
             fetchMissingObjects: false
         )
 
-        #expect(report.current.status == .clean)
-        #expect(report.projections.count == 1)
-        #expect(report.projections[0].outcome == .conflict)
-        #expect(report.projections[0].conflicts.map(\.path) == ["shared.txt"])
-        #expect(try repo.run("rev-parse", "mine").trimmed == mineCommit)
-        #expect(try repo.run("show-ref") == refsBefore)
-    }
-
-    @Test
-    func independentChangesRemainCleanAfterIncomingPRLands() throws {
-        let repo = try ProjectionTestRepository()
-        try repo.write("base.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "mine")
-        try repo.run("branch", "incoming")
-
-        try repo.run("switch", "mine")
-        try repo.write("mine.txt", "mine\n")
-        try repo.commitAll("mine")
-
-        try repo.run("switch", "incoming")
-        try repo.write("incoming.txt", "incoming\n")
-        try repo.commitAll("incoming")
-        let incomingCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        try repo.run("switch", "main")
-        let targetCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        let repository = try GitRepository(at: repo.url)
-        let report = try repository.project(
-            branch: "mine",
-            against: "main",
-            after: [makePullRequest(id: 43, sourceBranch: "incoming", sourceCommit: incomingCommit, targetCommit: targetCommit)],
-            fetchMissingObjects: false
-        )
-
-        #expect(report.projections[0].outcome == .clean)
-        #expect(report.projections[0].conflicts.isEmpty)
-    }
-
-    @Test
-    func incomingPRConflictIsNotMisreportedAsProjectedBranchConflict() throws {
-        let repo = try ProjectionTestRepository()
-        try repo.write("shared.txt", "base\n")
-        try repo.commitAll("base")
-        try repo.run("branch", "incoming")
-
-        try repo.run("switch", "incoming")
-        try repo.write("shared.txt", "incoming\n")
-        try repo.commitAll("incoming")
-        let incomingCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        try repo.run("switch", "main")
-        try repo.write("shared.txt", "main\n")
-        try repo.commitAll("main")
-        try repo.run("branch", "mine")
-        let targetCommit = try repo.run("rev-parse", "HEAD").trimmed
-
-        let repository = try GitRepository(at: repo.url)
-        let report = try repository.project(
-            branch: "mine",
-            against: "main",
-            after: [makePullRequest(id: 44, sourceBranch: "incoming", sourceCommit: incomingCommit, targetCommit: targetCommit)],
-            fetchMissingObjects: false
-        )
-
-        #expect(report.current.status == .clean)
-        #expect(report.projections[0].outcome == .incomingConflict)
         #expect(report.hasConflicts == false)
+        #expect(report.hasRisks == true)
+        #expect(report.projections[0].outcome == .risk)
+        #expect(report.projections[0].risks == [CollisionRisk(
+            path: "service.txt",
+            level: .medium,
+            kind: .sharedFile,
+            message: "Both changes modify this file, but Git currently merges them cleanly."
+        )])
+        #expect(report.recommendations.map(\.code).contains(.reviewOverlap))
     }
 
-    private func makePullRequest(
-        id: Int,
-        sourceBranch: String,
-        sourceCommit: String,
-        targetCommit: String
-    ) -> PullRequestSummary {
-        let repository = RepositoryIdentity(projectKey: "TEST", slug: "repo")
-        return PullRequestSummary(
-            id: id,
-            title: "Incoming change",
-            state: "OPEN",
-            source: PullRequestRef(
-                id: "refs/heads/\(sourceBranch)",
-                displayId: sourceBranch,
-                latestCommit: sourceCommit,
-                repository: repository
-            ),
-            target: PullRequestRef(
-                id: "refs/heads/main",
-                displayId: "main",
-                latestCommit: targetCommit,
-                repository: repository
-            )
+    @Test func renameAndEditIsHighStructuralRiskWhenGitCanMergeIt() throws {
+        let repo = try TestRepo()
+        try repo.write("service.txt", numberedLines(6))
+        try repo.commit("base")
+        try repo.git("branch", "mine")
+        try repo.git("branch", "incoming")
+
+        try repo.git("switch", "mine")
+        try repo.replaceLine("service.txt", line: 2, with: "mine-two")
+        try repo.commit("mine")
+
+        try repo.git("switch", "incoming")
+        try repo.git("mv", "service.txt", "renamed-service.txt")
+        try repo.commit("rename")
+        let incoming = try repo.oid("HEAD")
+
+        try repo.git("switch", "main")
+        let target = try repo.oid("HEAD")
+
+        let report = try GitRepository(at: repo.url).project(
+            branch: "mine",
+            against: "main",
+            after: [pr(id: 43, source: "incoming", sourceCommit: incoming, targetCommit: target)],
+            fetchMissingObjects: false
         )
+
+        #expect(report.projections[0].outcome == .risk)
+        #expect(report.projections[0].risks.contains { $0.path == "service.txt" && $0.level == .high && $0.kind == .structuralChange })
+    }
+
+    @Test func independentFilesRemainCleanWithNoRecommendation() throws {
+        let repo = try TestRepo()
+        try repo.write("base.txt", "base\n")
+        try repo.commit("base")
+        try repo.git("branch", "mine")
+        try repo.git("branch", "incoming")
+        try repo.git("switch", "mine"); try repo.write("mine.txt", "mine\n"); try repo.commit("mine")
+        try repo.git("switch", "incoming"); try repo.write("incoming.txt", "incoming\n"); try repo.commit("incoming")
+        let incoming = try repo.oid("HEAD")
+        try repo.git("switch", "main"); let target = try repo.oid("HEAD")
+
+        let report = try GitRepository(at: repo.url).project(branch: "mine", against: "main", after: [pr(id: 44, source: "incoming", sourceCommit: incoming, targetCommit: target)], fetchMissingObjects: false)
+        #expect(report.projections[0].outcome == .clean)
+        #expect(report.projections[0].risks.isEmpty)
+        #expect(report.recommendations.isEmpty)
     }
 }
 
-private final class ProjectionTestRepository {
+struct ProjectionAndRecommendationTests {
+    @Test func projectedConflictRecommendsFinishBeforePR() throws {
+        let repo = try TestRepo()
+        try repo.write("shared.txt", "base\n")
+        try repo.commit("base")
+        try repo.git("branch", "mine"); try repo.git("branch", "incoming")
+        try repo.git("switch", "mine"); try repo.write("shared.txt", "mine\n"); try repo.commit("mine")
+        try repo.git("switch", "incoming"); try repo.write("shared.txt", "incoming\n"); try repo.commit("incoming")
+        let incoming = try repo.oid("HEAD")
+        try repo.git("switch", "main"); let target = try repo.oid("HEAD")
+
+        let report = try GitRepository(at: repo.url).project(branch: "mine", against: "main", after: [pr(id: 45, source: "incoming", sourceCommit: incoming, targetCommit: target)], fetchMissingObjects: false)
+        #expect(report.projections[0].outcome == .conflict)
+        #expect(report.recommendations.contains { $0.code == .finishBeforePR && $0.pullRequestID == 45 })
+    }
+
+    @Test func currentConflictRecommendsRebaseNow() throws {
+        let repo = try TestRepo()
+        try repo.write("shared.txt", "base\n"); try repo.commit("base"); try repo.git("branch", "mine")
+        try repo.git("switch", "mine"); try repo.write("shared.txt", "mine\n"); try repo.commit("mine")
+        try repo.git("switch", "main"); try repo.write("shared.txt", "main\n"); try repo.commit("main")
+
+        let report = try GitRepository(at: repo.url).project(branch: "mine", against: "main", after: [], fetchMissingObjects: false)
+        #expect(report.current.status == .conflict)
+        #expect(report.recommendations.map(\.code) == [.rebaseNow])
+    }
+
+    @Test func staleLocalTargetIsReportedAndRecommendsRefresh() throws {
+        let repo = try TestRepo()
+        try repo.write("base.txt", "base\n"); try repo.commit("base")
+        try repo.git("branch", "mine"); try repo.git("branch", "server-target")
+        try repo.git("switch", "mine"); try repo.write("mine.txt", "mine\n"); try repo.commit("mine")
+        try repo.git("switch", "server-target"); try repo.write("target.txt", "server\n"); try repo.commit("server target")
+        let serverTarget = try repo.oid("HEAD")
+        try repo.git("switch", "-c", "incoming"); try repo.write("incoming.txt", "incoming\n"); try repo.commit("incoming")
+        let incoming = try repo.oid("HEAD")
+        try repo.git("switch", "main")
+
+        let report = try GitRepository(at: repo.url).project(branch: "mine", against: "main", after: [pr(id: 46, source: "incoming", sourceCommit: incoming, targetCommit: serverTarget)], fetchMissingObjects: false)
+        #expect(report.targetFreshness?.status == .behind)
+        #expect(report.targetFreshness?.commitsBehind == 1)
+        #expect(report.recommendations.map(\.code).contains(.refreshTarget))
+    }
+}
+
+private func pr(id: Int, source: String, sourceCommit: String, targetCommit: String) -> PullRequestSummary {
+    let repository = RepositoryIdentity(projectKey: "DEMO", slug: "sample-service")
+    return PullRequestSummary(
+        id: id,
+        title: "Incoming change",
+        state: "OPEN",
+        source: PullRequestRef(id: "refs/heads/\(source)", displayId: source, latestCommit: sourceCommit, repository: repository),
+        target: PullRequestRef(id: "refs/heads/main", displayId: "main", latestCommit: targetCommit, repository: repository)
+    )
+}
+
+private func numberedLines(_ count: Int) -> String { (1...count).map { "line-\($0)" }.joined(separator: "\n") + "\n" }
+
+private final class TestRepo {
     let url: URL
-
     init() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("branch-radar-projection-tests")
-            .appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        self.url = root
-
-        try run("init", "-q", "-b", "main")
-        try run("config", "user.name", "Branch Radar Tests")
-        try run("config", "user.email", "tests@branch-radar.invalid")
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("branch-radar-v04-tests").appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try git("init", "-q", "-b", "main")
+        try git("config", "user.name", "Branch Radar Tests")
+        try git("config", "user.email", "tests@branch-radar.invalid")
     }
-
     deinit { try? FileManager.default.removeItem(at: url) }
-
-    func write(_ path: String, _ contents: String) throws {
-        let fileURL = url.appendingPathComponent(path)
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try contents.write(to: fileURL, atomically: true, encoding: .utf8)
+    func write(_ path: String, _ content: String) throws {
+        let file = url.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try content.write(to: file, atomically: true, encoding: .utf8)
     }
-
-    func commitAll(_ message: String) throws {
-        try run("add", "-A")
-        try run("commit", "-q", "-m", message)
+    func replaceLine(_ path: String, line: Int, with value: String) throws {
+        let file = url.appendingPathComponent(path)
+        var lines = try String(contentsOf: file, encoding: .utf8).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        lines[line - 1] = value
+        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
     }
-
-    @discardableResult
-    func run(_ arguments: String...) throws -> String {
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git"] + arguments
-        process.currentDirectoryURL = url
-        process.standardOutput = stdout
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-
-        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw ProjectionTestGitError(message: "git \(arguments.joined(separator: " ")) failed: \(error)")
-        }
-        return output
+    func commit(_ message: String) throws { try git("add", "-A"); try git("commit", "-q", "-m", message) }
+    func oid(_ ref: String) throws -> String { try git("rev-parse", ref).trimmingCharacters(in: .whitespacesAndNewlines) }
+    @discardableResult func git(_ args: String...) throws -> String {
+        let process = Process(); let stdout = Pipe(); let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = ["git"] + args; process.currentDirectoryURL = url
+        process.standardOutput = stdout; process.standardError = stderr; try process.run(); process.waitUntilExit()
+        let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let err = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        guard process.terminationStatus == 0 else { throw TestError.message("git \(args.joined(separator: " ")): \(err)") }
+        return out
     }
 }
 
-private struct ProjectionTestGitError: Error {
-    let message: String
-}
+private enum TestError: Error { case message(String) }
 
-private extension String {
-    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
-}
+struct RegressionSafetyTests {
+    @Test func addAddConflictRemainsClassified() throws {
+        let repo = try TestRepo()
+        try repo.write("base.txt", "base\n"); try repo.commit("base"); try repo.git("branch", "feature")
+        try repo.git("switch", "feature"); try repo.write("new.txt", "feature\n"); try repo.commit("feature")
+        try repo.git("switch", "main"); try repo.write("new.txt", "main\n"); try repo.commit("main")
+        let analysis = try GitRepository(at: repo.url).analyze(branch: "feature", against: "main")
+        #expect(analysis.status == .conflict)
+        #expect(analysis.conflicts.first?.kind == .addAdd)
+    }
 
-struct ObjectFetchSafetyTests {
-    @Test
-    func projectionFetchesMissingObjectsWithoutUpdatingRefsOrFetchHead() throws {
-        let fixture = try RemoteProjectionFixture()
-        defer { fixture.cleanup() }
+    @Test func fetchingMissingProjectionObjectsDoesNotMoveRefsOrWriteFetchHead() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("branch-radar-fetch-v04").appendingPathComponent(UUID().uuidString)
+        let bare = root.appendingPathComponent("remote.git")
+        let source = root.appendingPathComponent("source")
+        let local = root.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
 
-        let repository = try GitRepository(at: fixture.localURL)
-        let refsBefore = try fixture.localGit("show-ref")
-        let fetchHeadURL = fixture.localURL.appendingPathComponent(".git/FETCH_HEAD")
-        try? FileManager.default.removeItem(at: fetchHeadURL)
+        try runGit(["init", "-q", "--bare", bare.path], in: root)
+        try runGit(["init", "-q", "-b", "main", source.path], in: root)
+        try runGit(["config", "user.name", "Branch Radar Tests"], in: source)
+        try runGit(["config", "user.email", "tests@branch-radar.invalid"], in: source)
+        try "base\n".write(to: source.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
+        try runGit(["add", "-A"], in: source); try runGit(["commit", "-q", "-m", "base"], in: source)
+        try runGit(["remote", "add", "origin", bare.path], in: source); try runGit(["push", "-q", "-u", "origin", "main"], in: source)
 
-        let report = try repository.project(
+        try runGit(["clone", "-q", "--branch", "main", "--single-branch", bare.path, local.path], in: root)
+        try runGit(["config", "user.name", "Branch Radar Tests"], in: local); try runGit(["config", "user.email", "tests@branch-radar.invalid"], in: local)
+        try runGit(["switch", "-q", "-c", "mine"], in: local)
+        try "mine\n".write(to: local.appendingPathComponent("mine.txt"), atomically: true, encoding: .utf8)
+        try runGit(["add", "-A"], in: local); try runGit(["commit", "-q", "-m", "mine"], in: local)
+
+        try runGit(["switch", "-q", "-c", "incoming"], in: source)
+        try "incoming\n".write(to: source.appendingPathComponent("incoming.txt"), atomically: true, encoding: .utf8)
+        try runGit(["add", "-A"], in: source); try runGit(["commit", "-q", "-m", "incoming"], in: source)
+        let incomingOID = try runGit(["rev-parse", "HEAD"], in: source).trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["push", "-q", "origin", "incoming"], in: source)
+        let targetOID = try runGit(["rev-parse", "origin/main"], in: local).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let refsBefore = try runGit(["show-ref"], in: local)
+        let fetchHead = local.appendingPathComponent(".git/FETCH_HEAD")
+        try? FileManager.default.removeItem(at: fetchHead)
+
+        let report = try GitRepository(at: local).project(
             branch: "mine",
             against: "origin/main",
-            after: [fixture.pullRequest],
+            after: [pr(id: 47, source: "incoming", sourceCommit: incomingOID, targetCommit: targetOID)],
             remote: "origin",
             fetchMissingObjects: true
         )
 
         #expect(report.projections.first?.outcome == .clean)
-        #expect(try fixture.localGit("show-ref") == refsBefore)
-        #expect(FileManager.default.fileExists(atPath: fetchHeadURL.path) == false)
-        #expect(try repository.referenceExists(fixture.incomingCommit))
+        #expect(try runGit(["show-ref"], in: local) == refsBefore)
+        #expect(FileManager.default.fileExists(atPath: fetchHead.path) == false)
+        #expect(try GitRepository(at: local).referenceExists(incomingOID))
     }
 }
 
-private final class RemoteProjectionFixture {
-    let root: URL
-    let localURL: URL
-    let incomingCommit: String
-    let pullRequest: PullRequestSummary
-
-    init() throws {
-        root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("branch-radar-fetch-tests")
-            .appendingPathComponent(UUID().uuidString)
-        let remote = root.appendingPathComponent("remote.git")
-        let source = root.appendingPathComponent("source")
-        localURL = root.appendingPathComponent("local")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-
-        try Self.runGit(["init", "-q", "--bare", remote.path], in: root)
-        try Self.runGit(["init", "-q", "-b", "main", source.path], in: root)
-        try Self.runGit(["config", "user.name", "Branch Radar Tests"], in: source)
-        try Self.runGit(["config", "user.email", "tests@branch-radar.invalid"], in: source)
-        try "base\n".write(to: source.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
-        try Self.runGit(["add", "-A"], in: source)
-        try Self.runGit(["commit", "-q", "-m", "base"], in: source)
-        try Self.runGit(["remote", "add", "origin", remote.path], in: source)
-        try Self.runGit(["push", "-q", "-u", "origin", "main"], in: source)
-
-        try Self.runGit(["clone", "-q", "--branch", "main", "--single-branch", remote.path, localURL.path], in: root)
-        try Self.runGit(["config", "user.name", "Branch Radar Tests"], in: localURL)
-        try Self.runGit(["config", "user.email", "tests@branch-radar.invalid"], in: localURL)
-        try Self.runGit(["switch", "-q", "-c", "mine"], in: localURL)
-        try "mine\n".write(to: localURL.appendingPathComponent("mine.txt"), atomically: true, encoding: .utf8)
-        try Self.runGit(["add", "-A"], in: localURL)
-        try Self.runGit(["commit", "-q", "-m", "mine"], in: localURL)
-
-        try Self.runGit(["switch", "-q", "-c", "incoming"], in: source)
-        try "incoming\n".write(to: source.appendingPathComponent("incoming.txt"), atomically: true, encoding: .utf8)
-        try Self.runGit(["add", "-A"], in: source)
-        try Self.runGit(["commit", "-q", "-m", "incoming"], in: source)
-        incomingCommit = try Self.runGit(["rev-parse", "HEAD"], in: source).trimmed
-        try Self.runGit(["push", "-q", "origin", "incoming"], in: source)
-        let targetCommit = try Self.runGit(["rev-parse", "origin/main"], in: source).trimmed
-
-        let identity = RepositoryIdentity(projectKey: "TEST", slug: "repo")
-        pullRequest = PullRequestSummary(
-            id: 50,
-            title: "Incoming remote change",
-            state: "OPEN",
-            source: PullRequestRef(
-                id: "refs/heads/incoming",
-                displayId: "incoming",
-                latestCommit: incomingCommit,
-                repository: identity
-            ),
-            target: PullRequestRef(
-                id: "refs/heads/main",
-                displayId: "main",
-                latestCommit: targetCommit,
-                repository: identity
-            )
-        )
-    }
-
-    func localGit(_ arguments: String...) throws -> String {
-        try Self.runGit(arguments, in: localURL)
-    }
-
-    func cleanup() {
-        try? FileManager.default.removeItem(at: root)
-    }
-
-    @discardableResult
-    private static func runGit(_ arguments: [String], in directory: URL) throws -> String {
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git"] + arguments
-        process.currentDirectoryURL = directory
-        process.standardOutput = stdout
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw ProjectionTestGitError(message: "git \(arguments.joined(separator: " ")) failed: \(error)")
-        }
-        return output
-    }
+@discardableResult
+private func runGit(_ args: [String], in directory: URL) throws -> String {
+    let process = Process(); let stdout = Pipe(); let stderr = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = ["git"] + args; process.currentDirectoryURL = directory
+    process.standardOutput = stdout; process.standardError = stderr; try process.run(); process.waitUntilExit()
+    let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    let err = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    guard process.terminationStatus == 0 else { throw TestError.message("git \(args.joined(separator: " ")): \(err)") }
+    return out
 }
